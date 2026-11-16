@@ -173,3 +173,23 @@ func WithWindowSize(width, height int) ProgramOption {
 		p.height = height
 	}
 }
+
+// WithWindowPixelSize sets the initial terminal window size in pixels. It is
+// useful when the pixel dimensions are already known, for example from an
+// embedding terminal or a test harness. Programs normally discover this at
+// runtime with the terminal size reports instead.
+func WithWindowPixelSize(width, height int) ProgramOption {
+	return func(p *Program) {
+		p.pixelWidth = width
+		p.pixelHeight = height
+	}
+}
+
+// WithCellSize sets the initial terminal cell size in pixels. Programs
+// normally discover this at runtime with the terminal size reports instead.
+func WithCellSize(width, height int) ProgramOption {
+	return func(p *Program) {
+		p.cellWidth = width
+		p.cellHeight = height
+	}
+}

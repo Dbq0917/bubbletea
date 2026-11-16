@@ -95,6 +95,20 @@ type View struct {
 	//  ```
 	Content string
 
+	// Image is an optional bitmap to display in this view. It is rendered
+	// directly with the terminal's graphics protocol when the terminal
+	// supports one, and is ignored otherwise. Content remains the fallback
+	// and is drawn above the image, which makes it suitable for overlays such
+	// as status blocks and labels.
+	//
+	// The image is scaled from the terminal's pixel dimensions and cell
+	// metrics, preserving its aspect ratio. A nil Image keeps rendering
+	// behavior identical to a view that never used images.
+	//
+	// Image is a [View] field rather than part of [Model], [Cmd], or the
+	// View method signature, so existing programs do not need to change.
+	Image *Image
+
 	// OnMouse is an optional mouse message handler that can be used to
 	// intercept mouse messages that depends on view content from last render.
 	// It can be useful for implementing view-specific behavior without
@@ -572,6 +586,13 @@ type Program struct {
 
 	// Initial window size. Mainly used for testing.
 	width, height int
+	// Initial terminal pixel and cell sizes, if supplied by an option or
+	// learned at runtime.
+	pixelWidth, pixelHeight int
+	cellWidth, cellHeight   int
+	// graphicsProbed records that the runtime graphics/pixel probe has been
+	// sent for this run.
+	graphicsProbed bool
 
 	// whether to use hard tabs to optimize cursor movements
 	useHardTabs bool
@@ -832,6 +853,36 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 					}
 				}
 
+			case PrimaryDeviceAttributesMsg:
+				supported := HasSixel(msg)
+				p.setSixelSupport(supported)
+				// Let the model switch from its character fallback to the
+				// bitmap (or keep the fallback) without having to parse DA1
+				// itself.
+				go p.Send(GraphicsCapabilityMsg{Sixel: supported})
+
+			case GraphicsCapabilityMsg:
+				p.setSixelSupport(msg.Sixel)
+
+			case SixelSupportMsg:
+				p.setSixelSupport(msg.Supported)
+
+			case PixelSizeMsg:
+				p.pixelWidth, p.pixelHeight = msg.Width, msg.Height
+				if r, ok := p.renderer.(interface {
+					setPixelSize(int, int)
+				}); ok {
+					r.setPixelSize(msg.Width, msg.Height)
+				}
+
+			case CellSizeMsg:
+				p.cellWidth, p.cellHeight = msg.Width, msg.Height
+				if r, ok := p.renderer.(interface {
+					setCellSize(int, int)
+				}); ok {
+					r.setCellSize(msg.Width, msg.Height)
+				}
+
 			case MouseMsg:
 				switch msg.(type) {
 				case MouseClickMsg, MouseReleaseMsg, MouseWheelMsg, MouseMotionMsg:
@@ -885,7 +936,11 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 				continue
 
 			case WindowSizeMsg:
+				p.width, p.height = msg.Width, msg.Height
 				p.renderer.resize(msg.Width, msg.Height)
+				if p.graphicsProbed {
+					p.queryTerminalGeometry()
+				}
 
 			case windowSizeMsg:
 				go p.checkResize()
@@ -923,9 +978,60 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 // render renders the given view to the renderer.
 func (p *Program) render(model Model) {
 	if p.renderer != nil {
-		p.renderer.render(model.View()) // send view to renderer
+		view := model.View()
+		p.renderer.render(view) // send view to renderer
+		if view.Image != nil {
+			p.probeGraphics()
+		}
 		p.wakeRenderer()
 	}
+}
+
+// setSixelSupport records the terminal's runtime Sixel capability.
+func (p *Program) setSixelSupport(supported bool) {
+	if r, ok := p.renderer.(interface {
+		setSixelSupport(bool)
+	}); ok {
+		r.setSixelSupport(supported)
+	}
+}
+
+// canQueryTerminal reports whether terminal queries can be sent and their
+// replies read.
+func (p *Program) canQueryTerminal() bool {
+	return !p.disableRenderer && !p.disableInput
+}
+
+// probeGraphics asks the terminal for its graphics capability and pixel
+// geometry. The probe is started lazily on the first view that contains an
+// image, so programs that do not use images keep their existing output.
+func (p *Program) probeGraphics() {
+	if p.graphicsProbed {
+		return
+	}
+	p.graphicsProbed = true
+	if !p.canQueryTerminal() {
+		return
+	}
+
+	// DA1 contains Sixel as attribute 4. XTWINOPS 14 and 16 report the
+	// window size in pixels and the cell size in pixels respectively. Also
+	// request synchronized output, which image frames use to update
+	// atomically.
+	p.executeQuery(
+		ansi.RequestPrimaryDeviceAttributes +
+			ansi.WindowOp(14) +
+			ansi.WindowOp(16) +
+			ansi.RequestModeSynchronizedOutput,
+	)
+}
+
+// queryTerminalGeometry refreshes pixel and cell dimensions after a resize.
+func (p *Program) queryTerminalGeometry() {
+	if !p.canQueryTerminal() {
+		return
+	}
+	p.executeQuery(ansi.WindowOp(14) + ansi.WindowOp(16))
 }
 
 // wakeRenderer restarts the renderer's ticker if it was stopped because
@@ -1055,6 +1161,7 @@ func (p *Program) Run() (returnModel Model, returnErr error) {
 
 	p.finished = make(chan struct{})
 	defer close(p.finished)
+	p.graphicsProbed = false
 
 	if p.tracePath != "" {
 		if f, err := os.OpenFile(p.tracePath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600); err == nil {
@@ -1179,6 +1286,22 @@ func (p *Program) Run() (returnModel Model, returnErr error) {
 	// Set the color profile on the renderer and send it to the program.
 	p.renderer.setColorProfile(*p.profile)
 	go p.Send(ColorProfileMsg{*p.profile})
+
+	// Apply any caller-supplied pixel/cell geometry before the first frame.
+	if p.pixelWidth > 0 && p.pixelHeight > 0 {
+		if r, ok := p.renderer.(interface {
+			setPixelSize(int, int)
+		}); ok {
+			r.setPixelSize(p.pixelWidth, p.pixelHeight)
+		}
+	}
+	if p.cellWidth > 0 && p.cellHeight > 0 {
+		if r, ok := p.renderer.(interface {
+			setCellSize(int, int)
+		}); ok {
+			r.setCellSize(p.cellWidth, p.cellHeight)
+		}
+	}
 
 	// Send the initial size to the program.
 	go p.Send(resizeMsg)

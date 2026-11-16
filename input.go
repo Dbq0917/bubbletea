@@ -41,6 +41,10 @@ func (p *Program) translateInputEvent(e uv.Event) Msg {
 		return PasteEndMsg(e)
 	case uv.WindowSizeEvent:
 		return WindowSizeMsg(e)
+	case uv.PixelSizeEvent:
+		return PixelSizeMsg(e)
+	case uv.CellSizeEvent:
+		return CellSizeMsg(e)
 	case uv.CapabilityEvent:
 		return CapabilityMsg(e)
 	case uv.TerminalVersionEvent:
@@ -49,6 +53,8 @@ func (p *Program) translateInputEvent(e uv.Event) Msg {
 		return KeyboardEnhancementsMsg(e)
 	case uv.ModeReportEvent:
 		return ModeReportMsg(e)
+	case uv.PrimaryDeviceAttributesEvent:
+		return PrimaryDeviceAttributesMsg(e)
 	case uv.ProgramStatusSupportEvent:
 		return ProgramStatusSupportMsg{}
 	}

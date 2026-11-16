@@ -3,6 +3,7 @@ package tea
 import (
 	"bytes"
 	"fmt"
+	"image"
 	"image/color"
 	"io"
 	"runtime"
@@ -36,9 +37,33 @@ type cursedRenderer struct {
 	pendingErase  bool // an scr.Erase() is pending and hasn't been drained by flush yet
 	viewStale     bool // a resize occurred and we are waiting for render() to supply the new View
 	noInput       bool // whether input is disabled, in which case keyboard enhancement queries are pointless
+
+	sixelSupported   bool // the terminal advertised Sixel graphics support
+	pixelWidth       int  // terminal window width in pixels, when known
+	pixelHeight      int  // terminal window height in pixels, when known
+	cellWidth        int  // terminal cell width in pixels, when known
+	cellHeight       int  // terminal cell height in pixels, when known
+	cellSizeReported bool // cell size came from the terminal rather than being derived
+	imageDirty       bool // capability or geometry changed since the last flush
+	lastImageKey     imageRenderKey
+	cachedImageKey   imageRenderKey
+	cachedImageSixel string
 }
 
 var _ renderer = &cursedRenderer{}
+
+type imageRenderKey struct {
+	source   string
+	revision uint64
+	bounds   image.Rectangle
+	pixelW   int
+	pixelH   int
+	targetW  int
+	targetH  int
+	origin   image.Point
+	cellW    int
+	cellH    int
+}
 
 func newCursedRenderer(w io.Writer, env []string, width, height int) (s *cursedRenderer) {
 	s = new(cursedRenderer)
@@ -63,6 +88,53 @@ func (s *cursedRenderer) setLogger(logger uv.Logger) {
 // would arrive after the program has exited and leak into the shell.
 func (s *cursedRenderer) setNoInput(noInput bool) {
 	s.noInput = noInput
+}
+
+// setSixelSupport records the runtime graphics capability of the terminal.
+func (s *cursedRenderer) setSixelSupport(supported bool) {
+	s.mu.Lock()
+	if s.sixelSupported != supported {
+		s.sixelSupported = supported
+		s.lastImageKey = imageRenderKey{}
+		s.cachedImageKey = imageRenderKey{}
+		s.cachedImageSixel = ""
+		s.imageDirty = true
+	}
+	s.mu.Unlock()
+}
+
+// setPixelSize records the terminal window size in pixels and derives the
+// cell size when both pixel and cell dimensions are available.
+func (s *cursedRenderer) setPixelSize(width, height int) {
+	s.mu.Lock()
+	if width <= 0 || height <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	if s.pixelWidth != width || s.pixelHeight != height {
+		s.pixelWidth, s.pixelHeight = width, height
+		if !s.cellSizeReported && s.width > 0 && s.height > 0 {
+			s.cellWidth = max(1, width/s.width)
+			s.cellHeight = max(1, height/s.height)
+		}
+		s.imageDirty = true
+	}
+	s.mu.Unlock()
+}
+
+// setCellSize records the size of a terminal cell in pixels.
+func (s *cursedRenderer) setCellSize(width, height int) {
+	s.mu.Lock()
+	if width <= 0 || height <= 0 {
+		s.mu.Unlock()
+		return
+	}
+	if s.cellWidth != width || s.cellHeight != height {
+		s.cellWidth, s.cellHeight = width, height
+		s.imageDirty = true
+	}
+	s.cellSizeReported = true
+	s.mu.Unlock()
 }
 
 // resetKeyboardEnhancements writes the sequences that reset keyboard
@@ -105,6 +177,11 @@ func (s *cursedRenderer) start() {
 	// Mark that we're starting. This is used to restore some state when
 	// starting the renderer again after it was stopped.
 	s.starting = true
+	// A stopped renderer may have left the screen in a state where graphics
+	// were cleared (for example when leaving the alternate screen). Draw the
+	// image again on the next frame.
+	s.lastImageKey = imageRenderKey{}
+	s.imageDirty = true
 
 	if s.lastView == nil {
 		return
@@ -304,11 +381,6 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 
 	view := s.view
 	frameArea := uv.Rect(0, 0, s.width, s.height)
-	if len(view.Content) == 0 {
-		// If the component is nil, we should clear the screen buffer.
-		frameArea.Max.Y = 0
-	}
-
 	content := uv.NewStyledString(view.Content)
 	if !view.AltScreen {
 		// We need to resizes the screen based on the frame height and
@@ -318,6 +390,18 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 		// list. This is different from the alt screen buffer, which has a
 		// fixed height and width.
 		frameHeight := content.Height()
+		if len(view.Content) == 0 {
+			// An empty view has no lines of its own. An image with an explicit
+			// cell-space rectangle can still extend the inline frame.
+			frameHeight = 0
+		}
+		if view.Image.hasPixels() && s.sixelSupported && s.cellWidth > 0 && s.cellHeight > 0 {
+			if view.Image.Bounds.Empty() {
+				frameHeight = max(frameHeight, s.height)
+			} else {
+				frameHeight = max(frameHeight, view.Image.Bounds.Max.Y)
+			}
+		}
 		if frameHeight != frameArea.Dy() {
 			frameArea.Max.Y = frameHeight
 		}
@@ -328,7 +412,7 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 		_, _ = s.scr.WriteString(ansi.SetTabEvery8Columns)
 	}
 
-	if !s.starting && !closing && !s.pendingErase && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
+	if !s.starting && !closing && !s.pendingErase && !s.imageDirty && s.lastView != nil && viewEquals(s.lastView, &view) && frameArea == s.cellbuf.Bounds() {
 		// No changes, nothing to do.
 		return false, nil
 	}
@@ -336,6 +420,7 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 	// We're no longer starting.
 	s.starting = false
 	s.pendingErase = false
+	s.imageDirty = false
 
 	if frameArea != s.cellbuf.Bounds() {
 		s.scr.Erase() // Force a full redraw to avoid artifacts.
@@ -354,6 +439,8 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 	// we erase any old content.
 	s.cellbuf.Clear()
 	content.Draw(s.cellbuf, s.cellbuf.Bounds())
+
+	imageSeq, imageOrigin, imageKey, imageOK := s.prepareImage(view, frameArea)
 
 	// If the frame height is greater than the screen height, we drop the
 	// lines from the top of the buffer.
@@ -526,6 +613,14 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 		setProgramStatus(s, lps, view.ProgramStatus)
 	}
 
+	// The image is emitted before the cell updates. Put the renderer's cursor
+	// model at the image origin as well: the image sequence starts with an
+	// absolute move and terminal text is drawn above the bitmap, so the first
+	// cell movement must be relative to that same position.
+	if imageOK {
+		s.scr.SetPosition(imageOrigin.X, imageOrigin.Y)
+	}
+
 	// Render and queue changes to the screen buffer.
 	s.scr.Render(s.cellbuf.RenderBuffer)
 
@@ -551,7 +646,7 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 	}
 
 	// Check if we have any render updates to flush.
-	hasUpdates := s.buf.Len() > 0
+	hasUpdates := s.buf.Len() > 0 || imageOK
 
 	// Cursor visibility.
 	didShowCursor := s.lastView != nil && s.lastView.Cursor != nil
@@ -593,7 +688,11 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 		}
 	}
 
-	if s.syncdUpdates {
+	// Image updates are wrapped even when the terminal did not answer the
+	// synchronized-output query: mode 2026 is harmless when unsupported, and
+	// terminals that do support it get a single atomic bitmap + overlay frame.
+	syncFrame := s.syncdUpdates || imageOK
+	if syncFrame {
 		if hasUpdates {
 			// We have synchronized output updates enabled.
 			buf.WriteString(ansi.SetModeSynchronizedOutput)
@@ -608,10 +707,29 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 	}
 
 	if hasUpdates {
+		if imageOK {
+			buf.WriteString(imageSeq)
+			// The image sequence leaves the cursor at an implementation-
+			// defined position. Restore the origin assumed by the cell
+			// renderer before writing text updates.
+			buf.WriteString(ansi.CursorPosition(imageOrigin.X+1, imageOrigin.Y+1))
+			if s.lastView != nil && s.lastView.Content == view.Content {
+				// Only the bitmap changed. Re-emit the visible overlay cells
+				// so colored status blocks and labels stay above it.
+				imageCells := uv.Rect(
+					imageOrigin.X,
+					imageOrigin.Y,
+					(imageKey.targetW+imageKey.cellW-1)/imageKey.cellW,
+					(imageKey.targetH+imageKey.cellH-1)/imageKey.cellH,
+				)
+				buf.WriteString(overlaySequence(s.cellbuf, imageCells))
+				buf.WriteString(ansi.CursorPosition(imageOrigin.X+1, imageOrigin.Y+1))
+			}
+		}
 		buf.Write(s.buf.Bytes())
 	}
 
-	if s.syncdUpdates {
+	if syncFrame {
 		if shouldUpdateCursorVis && showCursor {
 			// Do we need to update the cursor visibility to visible? If so, do
 			// it here after writing any updates to the buffer.
@@ -639,6 +757,9 @@ func (s *cursedRenderer) flush(closing bool) (bool, error) {
 	}
 
 	s.lastView = &view
+	if imageOK {
+		s.lastImageKey = imageKey
+	}
 
 	return true, nil
 }
@@ -696,8 +817,13 @@ func (s *cursedRenderer) resize(w, h int) {
 	s.scr.Erase()
 	s.width, s.height = w, h
 	s.scr.Resize(s.width, s.height)
+	if !s.cellSizeReported && s.pixelWidth > 0 && s.pixelHeight > 0 && w > 0 && h > 0 {
+		s.cellWidth = max(1, s.pixelWidth/w)
+		s.cellHeight = max(1, s.pixelHeight/h)
+	}
 	s.pendingErase = true
 	s.viewStale = true
+	s.imageDirty = true
 	s.mu.Unlock()
 }
 
@@ -720,6 +846,7 @@ func (s *cursedRenderer) clearView() {
 	// mode is restored correctly when the program resumes after the subprocess
 	// exits (see close and start). See issue #431.
 	s.view.Content = ""
+	s.view.Image = nil
 	s.view.Cursor = nil
 	s.mu.Unlock()
 }
@@ -873,6 +1000,118 @@ func (s *cursedRenderer) onMouse(m MouseMsg) Cmd {
 	return nil
 }
 
+func imageSourceIdentity(src image.Image) string {
+	if src == nil {
+		return ""
+	}
+	return fmt.Sprintf("%T:%p", src, src)
+}
+
+func (i *Image) hasPixels() bool {
+	src := i.sourceImage()
+	return src != nil && !src.Bounds().Empty()
+}
+
+// prepareImage returns the Sixel sequence for the current image frame. The
+// sequence starts with an absolute cursor move so it is independent of the
+// cursor movements emitted by the cell renderer.
+func (s *cursedRenderer) prepareImage(view View, frameArea uv.Rectangle) (string, image.Point, imageRenderKey, bool) {
+	if view.Image == nil || !s.sixelSupported {
+		s.lastImageKey = imageRenderKey{}
+		return "", image.Point{}, imageRenderKey{}, false
+	}
+	src := view.Image.sourceImage()
+	if src == nil {
+		s.lastImageKey = imageRenderKey{}
+		return "", image.Point{}, imageRenderKey{}, false
+	}
+
+	width, height, origin, ok := view.Image.targetSize(frameArea, s.cellWidth, s.cellHeight)
+	if !ok {
+		s.lastImageKey = imageRenderKey{}
+		return "", image.Point{}, imageRenderKey{}, false
+	}
+
+	key := imageRenderKey{
+		source:   imageSourceIdentity(src),
+		revision: view.Image.Revision,
+		bounds:   view.Image.Bounds,
+		pixelW:   view.Image.PixelWidth,
+		pixelH:   view.Image.PixelHeight,
+		targetW:  width,
+		targetH:  height,
+		origin:   origin,
+		cellW:    s.cellWidth,
+		cellH:    s.cellHeight,
+	}
+	if key == s.lastImageKey {
+		return "", origin, key, false
+	}
+
+	cacheKey := key
+	cacheKey.origin = image.Point{}
+	if cacheKey != s.cachedImageKey || s.cachedImageSixel == "" {
+		scaled := scaleImage(src, width, height)
+		s.cachedImageSixel = encodeSixel(scaled)
+		s.cachedImageKey = cacheKey
+	}
+	if s.cachedImageSixel == "" {
+		return "", origin, key, false
+	}
+
+	seq := ansi.CursorPosition(origin.X+1, origin.Y+1) + s.cachedImageSixel
+	return seq, origin, key, true
+}
+
+// overlaySequence renders the visible, non-blank cells of the frame at their
+// absolute positions. It is used after a bitmap-only update so status blocks
+// and labels stay above a redrawn image even when the text itself did not
+// change. Untouched blank cells are skipped so they do not paint over
+// transparent parts of the bitmap.
+func overlaySequence(buf uv.ScreenBuffer, area uv.Rectangle) string {
+	area = area.Intersect(buf.Bounds())
+	var seq strings.Builder
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; {
+			cell := buf.CellAt(x, y)
+			if !cellVisible(cell) {
+				x++
+				continue
+			}
+
+			start := x
+			var line uv.Line
+			for x < area.Max.X {
+				cell = buf.CellAt(x, y)
+				if cell == nil {
+					break
+				}
+				if cell.Width == 0 {
+					// Continuation of the preceding wide cell.
+					line = append(line, *cell)
+					x++
+					continue
+				}
+				if !cellVisible(cell) {
+					break
+				}
+				line = append(line, *cell)
+				x += max(cell.Width, 1)
+			}
+			seq.WriteString(ansi.CursorPosition(start+1, y+1))
+			seq.WriteString(line.Render())
+		}
+	}
+	return seq.String()
+}
+
+func cellVisible(cell *uv.Cell) bool {
+	if cell == nil || cell.Width == 0 {
+		return false
+	}
+	return !cell.Equal(&uv.EmptyCell) || !cell.Style.IsZero() || !cell.Link.IsZero()
+}
+
 func setProgressBar(s *cursedRenderer, pb *ProgressBar) {
 	if pb == nil {
 		_, _ = s.scr.WriteString(ansi.ResetProgressBar)
@@ -925,6 +1164,7 @@ func viewEquals(a, b *View) bool {
 	}
 
 	if a.Content != b.Content ||
+		!imageEquals(a.Image, b.Image) ||
 		a.AltScreen != b.AltScreen ||
 		a.DisableBracketedPasteMode != b.DisableBracketedPasteMode ||
 		a.ReportFocus != b.ReportFocus ||
@@ -959,6 +1199,17 @@ func viewEquals(a, b *View) bool {
 	}
 
 	return true
+}
+
+func imageEquals(a, b *Image) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Revision == b.Revision &&
+		a.Bounds == b.Bounds &&
+		a.PixelWidth == b.PixelWidth &&
+		a.PixelHeight == b.PixelHeight &&
+		imageSourceIdentity(a.sourceImage()) == imageSourceIdentity(b.sourceImage())
 }
 
 func keyboardEnhancementsFlags(ke KeyboardEnhancements) int {
